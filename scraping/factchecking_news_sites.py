@@ -10,11 +10,14 @@ from datetime import date
 from dateutil.parser import parse
 import requests
 from dotenv import load_dotenv
+from selenium import webdriver
 load_dotenv()
 
 # necessary params?
 months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 
           'November', 'December']
+
+gecko_driver_path = environ['GECKO_DRIVER_PATH']
 
 def get_db():
     # setup db
@@ -74,8 +77,61 @@ def get_tree(url):
         html = requests.get(url, headers=headers)
     except Exception as e:
         print(f'failed request: {e}')
-    tree = fromstring(html.content)
+    if 'boomlive' in url:
+        html.encoding = 'utf-8'
+    #tree = fromstring(html.content)
+    tree = fromstring(html.text)
     return tree
+
+# site-agnostic scraping functions
+def scraping_site_links(getPost=None, links=None, db=None, langs=[], domain=None, csvErr=None, 
+                        body_div=None, img_link=None, header_div=None):
+    for l in tqdm(links, desc="links: "):
+        try:
+            if db.count_documents({'postURL': l}):
+                if csvErr:
+                    with open(csvErr, 'a') as f:
+                        f.write(f'\n{l},failed,link in db')
+                else:
+                    print(f'skipping post: {l}, already in db')
+            else:
+                if domain == 'thequint.com':
+                    driver = setup_driver()
+                    post = getPost(l, driver=driver, langs=langs, domain=domain, body_div=body_div, 
+                                   img_link=img_link, header_div=header_div)
+                    driver.close()
+                else:
+                    post = getPost(l, langs=langs, domain=domain, body_div=body_div, img_link=img_link, header_div=header_div)
+                db.insert_one(post)        
+                sleep(randint(1, 5))
+        except Exception as e:
+                if csvErr:
+                    with open(csvErr, 'a') as f:
+                        f.write(f'\n{l},failed,{e}')
+                else:
+                    print(f'failed @{l}: {e}')
+
+def get_live_links(getLinks=None, url=None, db=None, domain=None):
+    newLink = True
+    page_num = 1
+    all_links = []
+
+    while newLink:    
+        links, _ = getLinks(url=url, NUM_PAGES=[page_num], domain=domain)
+        if len(links) == 0:
+            newLink = False
+            print('No/No more links found')                
+            continue
+        for l in links:
+            if db.count_documents({'postURL': l}):
+                newLink = False
+            else:
+                all_links.append(l)
+                
+        #all_links += links
+        page_num += 1
+        
+    return all_links, page_num
 
 # altnews specific helper functions
 def get_post_links_from_page_altnews(url='https://www.altnews.in'):
@@ -120,7 +176,7 @@ def get_content_altnews(tree, body_elements):
         
     return content
 
-def get_post_altnews(page_url, langs=[]):
+def get_post_altnews(page_url, langs=[], domain=None, body_div=None, img_link=None, header_div=None):
     # from a page url, get a post dict ready for upload to mongo
     tree = get_tree(page_url)
     metadata = get_metadata_altnews(tree)
@@ -129,7 +185,7 @@ def get_post_altnews(page_url, langs=[]):
 
     # fields
     postID = uuid.uuid4().hex
-    domain = 'altnews.in'
+    domain = domain
     # uniform date format
     nowDate = date.today().strftime("%B %d, %Y")
     date_updated = parse(metadata['date_updated']).strftime("%B %d, %Y")
@@ -157,7 +213,7 @@ def get_post_altnews(page_url, langs=[]):
     
     return post
 
-def get_historical_links_altnews(url='https://www.altnews.in', NUM_PAGES=[1]):
+def get_historical_links_altnews(url='https://www.altnews.in', NUM_PAGES=[1], ifSleep=True, domain=None):
     # get story links based on url and page range
     #LAST_PAGE = 20
     #NUM_PAGES = arange(20, 175)
@@ -167,7 +223,8 @@ def get_historical_links_altnews(url='https://www.altnews.in', NUM_PAGES=[1]):
         page_url = f'{url}/page/{page}'
         curLinks = get_post_links_from_page_altnews(page_url)
         links += curLinks
-        sleep(randint(10, 20))
+        if ifSleep:
+            sleep(randint(10, 20))
 
     return links, NUM_PAGES
 
@@ -182,19 +239,15 @@ def scraping_altnews_historical(url='https://www.altnews.in', db=None, langs=[],
             sleep(randint(10, 20))
             
     print(f'Historical scraping complete, pages: {NUM_PAGES[0]}:{NUM_PAGES[-1]}')
-        
-def scraping_altnews_rss():
-    return None
-
+                    
 # boomlive specific helper functions
 # get metadata
 def get_metadata_boomlive(tree):
     headline = tree.xpath('//h1')[0].text
-    datestr = tree.xpath('//time')[0].text.split('Updated: ')[-1]
+    datestr = tree.xpath('//span[contains(@class,"date")]//span')[0].text
     datestr = parse(datestr).strftime("%B %d, %Y")
-    author = tree.xpath('//a[@rel="author"]')
-    author_name = author[0].text
-    author_link = author[0].get('href')
+    author_name = tree.xpath('//a[contains(@class,"author-name")]')[0].text
+    author_link = None
     metadata = {'headline': headline, 'author': author_name, 'author_link': author_link, 'date_updated': datestr}
     return metadata
 
@@ -228,6 +281,8 @@ def get_content_boomlive(tree, body_elements, body_div='div[@class="pf-content"]
 
     # images
     images = tree.xpath(f'//{body_div}//figure/img')
+    images += tree.xpath(f'//{body_div}//div[contains(@class,"image-and-caption-wrapper")]//img')
+    images += tree.xpath(f'//div[@class="single-featured-thumb-container"]/img')
     for i in images:
         content['image'].append(i.get(img_link))
 
@@ -249,11 +304,11 @@ def get_content_boomlive(tree, body_elements, body_div='div[@class="pf-content"]
         
     return content
 
-def get_post_boomlive(page_url, langs=[], domain=None, body_div='div[@class="pf-content"]', img_link='data-src'):
+def get_post_boomlive(page_url, langs=[], domain=None, body_div='div[@class="pf-content"]', img_link='data-src', header_div=None):
     # from a page url, get a post dict ready for upload to mongo
     tree = get_tree(page_url)
     metadata = get_metadata_boomlive(tree)
-    body_elements = tree.xpath(f'//{body_div}/p')
+    body_elements = tree.xpath(f'//{body_div}/*[self::p or self::div[@class="pasted-from-word-wrapper"]/p]')
     content = get_content_boomlive(tree, body_elements, body_div=body_div, img_link=img_link)
     
     # fields
@@ -285,23 +340,32 @@ def get_post_boomlive(page_url, langs=[], domain=None, body_div='div[@class="pf-
     
     return post
 
-def get_post_links_from_page_boomlive(url=None):
+def get_post_links_from_page_boomlive(url=None, domain=None):
     tree= get_tree(url)
-    all_links = tree.xpath('//div[contains(@class, "mvp-main-blog-text")]/a[@rel="bookmark"]')
+    all_links = tree.xpath('//h2/a')
     links = []
+    if domain == 'boomlive.in':
+        prefix = f'https://www.{domain}'
+    else:
+        prefix = f'https://{domain}'
     for i, x in enumerate(all_links):
-        links.append(x.get('href'))
+        curLink = x.get('href')
+        if 'boomlive' not in curLink:
+            links.append(f'{prefix}{curLink}')
+        else:
+            links.append(x.get('href'))
     
     return links
 
-def get_historical_links_boomlive(url=None, NUM_PAGES=[1]):
+def get_historical_links_boomlive(url=None, NUM_PAGES=[1], domain=None):
     # get story links based on url and page range
     links = []
-    for page in tqdm(NUM_PAGES, desc="pages: "):
+    for page in NUM_PAGES:
         page_url = f'{url}/page/{page}'
-        curLinks = get_post_links_from_page_boomlive(url=page_url)
+        curLinks = get_post_links_from_page_boomlive(url=page_url, domain=domain)
         links += curLinks
-        sleep(randint(5, 15))
+        print(f'{page}: {len(links)}')
+        sleep(randint(1, 5))
 
     return links, NUM_PAGES
 
@@ -354,7 +418,7 @@ def get_content_factly(tree, body_elements, body_div=None):
                         
     return content
 
-def get_post_factly(page_url, langs=[], domain=None, body_div=None):
+def get_post_factly(page_url, langs=[], domain=None, body_div=None, img_link=None, header_div=None):
     # from a page url, get a post dict ready for upload to mongo
     tree = get_tree(page_url)
     metadata = get_metadata_factly(tree)
@@ -390,6 +454,19 @@ def get_post_factly(page_url, langs=[], domain=None, body_div=None):
     
     return post
 
+def get_historical_links_factly(url=None, NUM_PAGES=[1], domain=None):
+    # get story links based on url and page range
+    links = []
+    for page in tqdm(NUM_PAGES, desc="pages: "):
+        page_url = f'{url}/page/{page}'
+        sleep(1)
+        tree = get_tree(page_url)
+        all_links = tree.xpath('//div[contains(@class,"main-content")]//h2[@class="post-title"]/a[@href]')
+        for l in all_links:
+            links.append(l.get('href'))
+
+    return links, NUM_PAGES
+
 def dump_links_factly():
     # loop through all links
     links = []
@@ -410,7 +487,7 @@ def dump_links_factly():
         for l in links:
             f.write(f'{l}\n')
 
-def scraping_factly_historical(links=links, db=None, langs=[], domain=None, body_div=body_div):
+def scraping_factly_historical(links=None, db=None, langs=[], domain=None, body_div=None):
     print(db.count_documents({}))
     for l in tqdm(links, desc="links: "):
         if db.count_documents({'postURL': l}):
@@ -502,12 +579,12 @@ def get_content_quint(driver):
         
     return content
 
-def get_post_quint(page_url, driver=None, langs=[], domain=None):
+def get_post_quint(page_url, driver=None, langs=[], domain=None, body_div=None, img_link=None, header_div=None):
     # from a page url, get a post dict ready for upload to mongo
 
     tree = get_tree(page_url)
     metadata = get_metadata_quint(tree)
-    driver = get_driver(page_url, driver, wait_time=wait_time)
+    driver = get_driver(page_url, driver, wait_time=3)
     content = get_content_quint(driver)
         
     # fields
@@ -558,6 +635,22 @@ def dump_links_quint():
     with open('quint_links', 'w') as f:
         for l in links:
             f.write(f'{l}\n')
+
+def get_historical_links_quint(url=None, NUM_PAGES=[1], domain=None):
+    # get story links based on url and page range
+    links = []
+    for page in tqdm(NUM_PAGES, desc="pages: "):
+        page_url = f'{url}/{page}'
+        sleep(1)
+        tree = get_tree(page_url)
+        
+        all_links = tree.xpath('//div[contains(@class,"ctg-news")]/a[@href]')
+        all_links = list(set(all_links))
+        
+        for l in all_links:
+            links.append(f"https://www.thequint.com{l.get('href')}")
+
+    return links, NUM_PAGES
 
 def scraping_quint_historical(links=None, db=None, langs=[], domain=None):
     print(db.count_documents({}))
@@ -663,7 +756,7 @@ def get_content_vishvasnews(tree, body_elements, body_div=None):
         
     return content
 
-def get_post_vishvasnews(page_url, langs=[], domain=None, body_div=None):
+def get_post_vishvasnews(page_url, langs=[], domain=None, body_div=None, img_link=None, header_div=None):
     # from a page url, get a post dict ready for upload to mongo
     tree = get_tree(page_url)
     metadata = get_metadata_vishvasnews(tree)
@@ -699,7 +792,7 @@ def get_post_vishvasnews(page_url, langs=[], domain=None, body_div=None):
     
     return post
 
-def scraping_vishvasnews_historical(links=links, db=None, langs=[], domain=None, body_div=body_div):
+def scraping_vishvasnews_historical(links=None, db=None, langs=[], domain=None, body_div=None):
     print(db.count_documents({}))
     for l in tqdm(links, desc="links: "):
         if db.count_documents({'postURL': l}):
@@ -722,7 +815,15 @@ def dump_links_vishvasnews(lang):
         url = 'https://www.vishvasnews.com/'
     else:
         url = f'https://www.vishvasnews.com/{lang}'
-    tree = get_tree(page_url)
+    tree = get_tree(url)
+
+    # selenium scrape
+    options = webdriver.FirefoxOptions()
+    options.add_argument('--headless')
+                         
+    # profile
+    profile = webdriver.FirefoxProfile()
+    profile.set_preference('browser.download.manager.showWhenStarting', False)
 
     # using firefox gecko driver
     driver = webdriver.Firefox(executable_path=gecko_driver_path, firefox_profile=profile, options=options)
@@ -765,6 +866,61 @@ def dump_links_vishvasnews(lang):
         for l in links:
             f.write(f'{l}\n')
 
+def get_historical_links_vishvasnews(url=None, NUM_PAGES=[1], domain=None):
+    # NOTE: need to run this with a GUI session
+    # lang = ['assamese', 'english', 'hindi', 'urdu', 'punjabi']
+    tree = get_tree(url)
+
+    options = webdriver.FirefoxOptions()
+    options.add_argument('--headless')
+
+    # firefox profile
+    profile = webdriver.FirefoxProfile()
+    profile.set_preference('browser.download.manager.showWhenStarting', False)
+
+    # using firefox gecko driver
+    driver = webdriver.Firefox(executable_path=gecko_driver_path, firefox_profile=profile, options=options)
+    driver.maximize_window() #For maximizing window
+
+    driver.get(url)
+    driver.implicitly_wait(3) #gives an implicit wait for n seconds
+    while driver.execute_script("return document.readyState") != 'complete':
+        pass
+
+    i = 0
+    more_posts_link = True
+    more_posts_link = driver.find_elements_by_xpath('//div[@class="nav-links"]/a')[0]
+
+    while True and i < 10:
+        driver.execute_script('arguments[0].scrollIntoView();', more_posts_link)
+
+        articles = driver.find_elements_by_xpath('//div/h3/a')
+        print(len(set(articles)))
+
+        try:
+            more_posts_link.click()
+            print(i, ' clicked!')
+            i += 1
+        except Exception as e:
+            break
+
+        sleep(0.5)
+
+        try:
+            more_posts_link = driver.find_elements_by_xpath('//div[@class="nav-links"]/a')[0]
+        except Exception as e:
+            print(f'failed: no more posts: {e}')
+            break
+
+    links = []
+    for a in set(articles):
+        links.append(a.get_attribute('href'))
+        links = list(set(links))
+    
+    driver.close()
+                         
+    return links, NUM_PAGES
+                         
 def run_vishvasnews():
     langs = ['assamese', 'english', 'hindi', 'urdu', 'punjabi']
     db = get_db()
@@ -862,7 +1018,7 @@ def dump_links_indiatoday():
     # loop through all links
     links = []
 
-    for page_num in tqdm(range(0, 14), desc="links: "):
+    for page_num in tqdm(range(0, 50), desc="links: "):
         page_url = f'https://www.indiatoday.in/fact-check?page={page_num}&view_type=list'
         sleep(1)
         tree = get_tree(page_url)
@@ -878,7 +1034,23 @@ def dump_links_indiatoday():
         for l in links:
             f.write(f'{l}\n')
 
-def get_post_indiatoday(page_url, langs=[], domain=None, body_div=None, header_div=None):
+def get_historical_links_indiatoday(url=None, NUM_PAGES=[1], domain=None):
+    # get story links based on url and page range
+    links = []
+    for page in tqdm(NUM_PAGES, desc="pages: "):
+        page_url = f'{url}?page={page}&view_type=list'
+        sleep(1)
+        tree = get_tree(page_url)
+        
+        all_links = tree.xpath('//h2/a[@href]')
+
+        for l in all_links:
+            links.append(f"https://www.indiatoday.in{l.get('href')}")
+        links = list(set(links))
+                         
+    return links, NUM_PAGES
+                         
+def get_post_indiatoday(page_url, langs=[], domain=None, body_div=None, header_div=None, img_link=None):
     # from a page url, get a post dict ready for upload to mongo
     tree = get_tree(page_url)
 
@@ -924,7 +1096,7 @@ def get_post_indiatoday(page_url, langs=[], domain=None, body_div=None, header_d
     
     return post
 
-def scraping_indiatoday_historical(links=links, db=None, langs=[], domain=None, body_div=body_div, header_div=header_div):
+def scraping_indiatoday_historical(links=None, db=None, langs=[], domain=None, body_div=None, header_div=None):
     print(db.count_documents({}))
     for l in tqdm(links, desc="links: "):
         if db.count_documents({'postURL': l}):

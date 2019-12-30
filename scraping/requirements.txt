@@ -1,4 +1,6 @@
-webdriver
+selenium
 pymongo
+boto3
 python_dotenv
 tqdm
+psutil
